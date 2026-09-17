@@ -1,0 +1,53 @@
+@import url('https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600;700&family=JetBrains+Mono:wght@300;400;500;600&display=swap');
+@import 'tailwindcss';
+
+@theme inline {
+  --color-background: #07090e;
+  --color-surface: #0d1220;
+  --color-surface-2: #141b2d;
+  --color-surface-3: #1c2540;
+  --color-border: rgba(255,255,255,0.07);
+  --color-border-bright: rgba(255,255,255,0.14);
+  --color-accent: #00c8f0;
+  --color-accent-dim: rgba(0,200,240,0.12);
+  --color-accent-glow: rgba(0,200,240,0.25);
+  --color-warm: #ff7043;
+  --color-warm-dim: rgba(255,112,67,0.12);
+  --color-success: #26d07c;
+  --color-success-dim: rgba(38,208,124,0.12);
+  --color-muted: #4a5568;
+  --color-text: #dce6f5;
+  --color-text-2: #8896b0;
+  --color-text-3: #4a5568;
+  --font-ui: 'Outfit', sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  -webkit-tap-highlight-color: transparent;
+}
+
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  background: var(--color-background);
+  color: var(--color-text);
+  font-family: var(--font-ui);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+::-webkit-scrollbar { width: 3px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--color-border-bright); border-radius: 2px; }
+
+button {
+  cursor: pointer;
+  user-select: none;
+  -webkit-user-select: none;
+  touch-action: manipulation;
+}
+
+button:active { transform: scale(0.96); }

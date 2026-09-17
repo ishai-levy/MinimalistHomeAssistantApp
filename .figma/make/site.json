@@ -1,0 +1,10 @@
+{
+  "description": "Streamline home automation and media control with a minimalist interface displaying time, weather, and intuitive buttons for smart devices.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}

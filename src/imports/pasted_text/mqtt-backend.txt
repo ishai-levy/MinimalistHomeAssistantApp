@@ -1,0 +1,896 @@
+((venv) ) orangepi@brain:~/dashboard$ cat mqtt_backend.py
+import os
+import json
+import time
+import uuid
+import asyncio
+import mimetypes
+import threading
+import datetime
+from urllib.parse import urlsplit, urlunsplit, unquote, parse_qs
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+import requests
+import websockets
+import paho.mqtt.client as mqtt
+from music_assistant_client import MusicAssistantClient
+
+# --- Home Assistant ---
+# HA_URL/MA_URL/MQTT_HOST/ports are all required from the env file --
+# no in-code hostname/port defaults. See /etc/ha-dashboard/env.
+HA_URL = os.environ["HA_URL"]
+HA_TOKEN = os.environ["HA_TOKEN"]
+HA_HEADERS = {"Authorization": f"Bearer {HA_TOKEN}", "Content-Type": "application/json"}
+
+def _ws_url_from(http_url):
+    parts = urlsplit(http_url)
+    scheme = "wss" if parts.scheme == "https" else "ws"
+    return urlunsplit((scheme, parts.netloc, "/api/websocket", "", ""))
+
+HA_WS_URL = _ws_url_from(HA_URL)
+
+# --- Music Assistant ---
+MA_URL = os.environ["MA_URL"]
+MA_TOKEN = os.environ["MA_TOKEN"]
+MA_HEADERS = {"Authorization": f"Bearer {MA_TOKEN}", "Content-Type": "application/json"}
+# Hard-coded default target for the one-touch "surprise me" radio button --
+# always Home group, unconditionally, regardless of whatever's selected for
+# fine-grained control elsewhere. See find_default_player() vs find_active_player().
+MA_PLAYER_NAME = os.environ.get("MA_PLAYER_NAME", "Home group")
+FAVORITES_PLAYLIST_URI = os.environ.get("FAVORITES_PLAYLIST_URI", "library://playlist/1")
+# config_entry_id for the music_assistant HA integration, needed by the
+# music_assistant.get_library service call used to fetch the playlist
+# catalog -- found via HA's Developer Tools > Actions. NOTE: this is NOT
+# stable -- it broke once already (2026-09-15) when the integration got
+# reconfigured. If playlists start 500ing again, re-check this value first.
+MA_CONFIG_ENTRY_ID = os.environ.get("MA_CONFIG_ENTRY_ID", "01KX8CK32PJZVVAYFX2KBR3V14")
+
+# --- MQTT ---
+MQTT_HOST = os.environ["MQTT_HOST"]
+MQTT_PORT = int(os.environ["MQTT_PORT"])
+MQTT_USER = os.environ["MQTT_USER"]
+MQTT_PASS = os.environ["MQTT_PASS"]
+STATE_TOPIC = "dashboard/state"
+CMD_TOPIC = "dashboard/cmd"
+
+# --- HTTP endpoint (playlists + players + sounds) ---
+# All served as plain HTTP instead of MQTT -- playlists/players are pulled
+# on-demand (dialog/selector opens), sounds need to be a real fetchable URL
+# for HA's announce feature (confirmed 2026-09-17: MA-internal library://
+# URIs don't work with announce, only real HTTP URLs do).
+# NOTE: this port must match what the LVGL client requests -- keep
+# PLAYLISTS_HTTP_PORT in sync between this env file and the client config.
+PLAYLISTS_HTTP_PORT = int(os.environ["PLAYLISTS_HTTP_PORT"])
+SOUNDS_DIR = os.environ.get("SOUNDS_DIR", "/home/orangepi/dashboard/sounds")
+# Alarm/timer sounds are local files living in SOUNDS_DIR, served by this
+# same process's HTTP server (see DashboardHTTPHandler's /sounds/ route).
+# Only filenames are configured here -- the backend builds the actual
+# http:// URL itself using MQTT_HOST, since that's the same box (brain)
+# this HTTP server binds on. Chromecast devices resolve MQTT_HOST the same
+# way everything else in this file already assumes they can.
+ALARM_SOUND_FILE = os.environ.get("ALARM_SOUND_FILE", "alarm.mp3")
+TIMER_SOUND_FILE = os.environ.get("TIMER_SOUND_FILE", "timer.mp3")
+ALARM_SOUND_URI = f"http://{MQTT_HOST}:{PLAYLISTS_HTTP_PORT}/sounds/{ALARM_SOUND_FILE}"
+TIMER_SOUND_URI = f"http://{MQTT_HOST}:{PLAYLISTS_HTTP_PORT}/sounds/{TIMER_SOUND_FILE}"
+SCHEDULE_STATE_FILE = os.environ.get("SCHEDULE_STATE_FILE", "/home/orangepi/dashboard/schedule_state.json")
+# Detected sound duration (+ buffer) is used ONLY to size the announce
+# HTTP request's timeout (a safety ceiling so a slow/long file doesn't get
+# cut off mid-playback) -- NOT to pace repeats. The announce call already
+# blocks in real time until Chromecast finishes, so pacing between
+# repeats is handled separately by ALARM_REPEAT_GAP_SECONDS below.
+ALARM_REPEAT_INTERVAL_SECONDS = float(os.environ.get("ALARM_REPEAT_INTERVAL_SECONDS", "15"))
+TIMER_REPEAT_INTERVAL_SECONDS = float(os.environ.get("TIMER_REPEAT_INTERVAL_SECONDS", "15"))
+REPEAT_INTERVAL_BUFFER_SECONDS = float(os.environ.get("REPEAT_INTERVAL_BUFFER_SECONDS", "1.5"))
+# Short pause AFTER a full announce cycle returns, before firing the next
+# one. NOT the same as the sound's duration -- the announce HTTP call
+# already blocks for the real playback duration (confirmed via testing:
+# a ~12s file produced a ~12s blocking call), so adding a second
+# duration-length wait on top of that double-counts and produces an
+# audible gap. This is just a small buffer between repeats, independent
+# of file length.
+ALARM_REPEAT_GAP_SECONDS = float(os.environ.get("ALARM_REPEAT_GAP_SECONDS", "1.0"))
+_sound_repeat_interval = {"alarm": ALARM_REPEAT_INTERVAL_SECONDS, "timer": TIMER_REPEAT_INTERVAL_SECONDS}
+
+WEATHER_ENTITY = "weather.forecast_home"
+DUDE_ENTITY = "switch.switcher_v4_8585"
+VACUUM_ENTITY = "vacuum.roborock_qrevo_s"
+WATCHED_ENTITIES = {DUDE_ENTITY, WEATHER_ENTITY, VACUUM_ENTITY}
+
+ACTIONS = {
+    "toggle_dude":  ("POST", "/api/services/switch/toggle", {"entity_id": DUDE_ENTITY}),
+    "find_phone":   ("POST", "/api/services/button/press", {"entity_id": "button.titan_ring"}),
+    "vacuum_start": ("POST", "/api/services/vacuum/start", {"entity_id": VACUUM_ENTITY}),
+    "vacuum_stop":  ("POST", "/api/services/vacuum/stop", {"entity_id": VACUUM_ENTITY}),
+    "vacuum_home":  ("POST", "/api/services/vacuum/return_to_base", {"entity_id": VACUUM_ENTITY}),
+}
+
+MEDIA_ACTIONS = {
+    "media_previous":   "players/cmd/previous",
+    "media_pause":      "players/cmd/pause",
+    "media_play":       "players/cmd/play",
+    "media_next":       "players/cmd/next",
+    "media_play_pause": "players/cmd/play_pause",
+}
+
+_ma_msg_id = 0
+
+_TYPOGRAPHIC_REPLACEMENTS = {
+    "\u2018": "'", "\u2019": "'",
+    "\u201c": '"', "\u201d": '"',
+    "\u2013": "-", "\u2014": "-",
+    "\u2026": "...",
+}
+
+def sanitize_text(s):
+    if not s:
+        return s
+    for orig, repl in _TYPOGRAPHIC_REPLACEMENTS.items():
+        s = s.replace(orig, repl)
+    return s
+
+def ha_request(method, path, body=None, timeout=5):
+    r = requests.request(method, f"{HA_URL}{path}", headers=HA_HEADERS, json=body, timeout=timeout)
+    r.raise_for_status()
+    return r.json() if r.content else {}
+
+def ma_request(command, args=None):
+    global _ma_msg_id
+    _ma_msg_id += 1
+    r = requests.post(
+        f"{MA_URL}/api",
+        headers=MA_HEADERS,
+        json={"message_id": str(_ma_msg_id), "command": command, "args": args or {}},
+        timeout=5,
+    )
+    if not r.ok:
+        print(f"[MA] {command} failed ({r.status_code}): {r.text}")
+    r.raise_for_status()
+    return r.json() if r.content else None
+
+# --- Player registry ---
+# _active_player_id is the fine-grained-control selection (transport,
+# shuffle, favorites, queue tracking, alarm/timer target). None means
+# "nothing explicitly selected yet" -> falls back to MA_PLAYER_NAME. The
+# radio button (start_radio) NEVER uses this -- it always targets
+# MA_PLAYER_NAME directly via find_default_player(), by design (single-touch,
+# always Home group, no dependency on whatever's selected elsewhere).
+_active_player_id = None
+
+def find_default_player():
+    players = ma_request("players/all") or []
+    return next((p for p in players if p.get("name") == MA_PLAYER_NAME), None)
+
+def find_active_player():
+    players = ma_request("players/all") or []
+    if _active_player_id:
+        p = next((p for p in players if p.get("player_id") == _active_player_id), None)
+        if p:
+            return p
+        print(f"[MA] selected player id {_active_player_id!r} not found, falling back to default")
+    return next((p for p in players if p.get("name") == MA_PLAYER_NAME), None)
+
+def find_player_by_id(player_id):
+    players = ma_request("players/all") or []
+    return next((p for p in players if p.get("player_id") == player_id), None)
+
+def ha_entity_id_for_player(player_id):
+    # MA player objects don't carry an HA entity_id (MA doesn't know about
+    # HA's registry) -- so instead we match on the "active_queue" attribute
+    # HA's music_assistant media_player entities expose, which equals the
+    # MA player_id once a queue's been established on that player. NOTE:
+    # unverified against a player that's been fully idle/off all session --
+    # active_queue may be absent until MA has set up a queue on it at least
+    # once. Confirmed working 2026-09-17 against an actively-playing player.
+    states = ha_request("GET", "/api/states")
+    for s in states:
+        if not s["entity_id"].startswith("media_player."):
+            continue
+        if s.get("attributes", {}).get("active_queue") == player_id:
+            return s["entity_id"]
+    return None
+
+def start_radio():
+    player = find_default_player()
+    if not player:
+        print(f"[MA] default player '{MA_PLAYER_NAME}' not found")
+        return
+    ma_request("player_queues/play_media", {
+        "queue_id": player["player_id"],
+        "media": FAVORITES_PLAYLIST_URI,
+        "radio_mode": True,
+        "enqueue": "replace",
+    })
+
+def toggle_shuffle():
+    player = find_active_player()
+    if not player:
+        print(f"[MA] no active player resolved")
+        return
+    # NOTE: player_queues/get_active_queue is unverified by an actual test
+    # (unlike player_queues/shuffle, which we've confirmed works) -- sourced
+    # from the same official MA client docs, so reasonably trusted, but
+    # watch the [MA] error log the first time this runs for real.
+    queue = ma_request("player_queues/get_active_queue", {"player_id": player["player_id"]})
+    current = bool(queue.get("shuffle_enabled")) if queue else False
+    ma_request("player_queues/shuffle", {
+        "queue_id": player["player_id"],
+        "shuffle_enabled": not current,
+    })
+    print(f"[shuffle] toggled shuffle to {not current}")
+
+# --- Favorites ---
+def add_favorite(uri):
+    ma_request("music/favorites/add_item", {"item": uri})
+
+def remove_favorite(uri):
+    # remove_item wants media_type + library_item_id, not the raw URI --
+    # this assumes a "library://<type>/<id>" shaped URI (e.g. as seen in
+    # now-playing/queue data once a track's actually in your library).
+    # Unverified for anything still provider-native (spotify://...) that
+    # was never resolved into the library -- test against a real URI first.
+    try:
+        _, rest = uri.split("library://", 1)
+        media_type, item_id = rest.split("/", 1)
+    except ValueError:
+        print(f"[favorite] couldn't parse library uri: {uri}")
+        return
+    ma_request("music/favorites/remove_item", {
+        "media_type": media_type, "library_item_id": item_id,
+    })
+
+# --- Alarm/timer scheduling ---
+# Fires via HA's media_player.play_media with announce=True, NOT via MA's
+# own play_media -- confirmed 2026-09-17 that MA's own announce handling
+# 500s on MA-internal library:// URIs (Chromecast can't resolve them
+# directly), but works correctly -- including genuine resume of the
+# interrupted queue at its prior position -- when given a real HTTP URL.
+# This is why ALARM_SOUND_URI/TIMER_SOUND_URI must be real http(s) URLs,
+# and why firing needs the HA entity_id rather than the MA player_id.
+_schedule_lock = threading.Lock()
+_schedule = []  # [{id, kind, trigger_at (epoch float), player_id}, ...]
+
+def _save_schedule():
+    with _schedule_lock:
+        data = list(_schedule)
+    try:
+        with open(SCHEDULE_STATE_FILE, "w") as f:
+            json.dump(data, f)
+    except Exception as e:
+        print(f"[schedule] save failed: {e}")
+
+def _load_schedule():
+    global _schedule
+    try:
+        with open(SCHEDULE_STATE_FILE) as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        data = []
+    except Exception as e:
+        print(f"[schedule] load failed: {e}")
+        data = []
+    now = time.time()
+    with _schedule_lock:
+        _schedule = [e for e in data if e.get("trigger_at", 0) > now]
+    dropped = len(data) - len(_schedule)
+    if dropped:
+        print(f"[schedule] dropped {dropped} expired entries from disk on load")
+    _publish_schedule_state()
+
+def _publish_schedule_state():
+    with _schedule_lock:
+        alarms = [e for e in _schedule if e["kind"] == "alarm"]
+        timers = [e for e in _schedule if e["kind"] == "timer"]
+    publish_state("alarms", alarms)
+    publish_state("timers", timers)
+
+def add_schedule_entry(kind, trigger_at, player_id):
+    entry = {"id": str(uuid.uuid4()), "kind": kind, "trigger_at": trigger_at, "player_id": player_id}
+    with _schedule_lock:
+        _schedule.append(entry)
+    _save_schedule()
+    _publish_schedule_state()
+    return entry
+
+def cancel_schedule_entry(entry_id):
+    with _schedule_lock:
+        before = len(_schedule)
+        _schedule[:] = [e for e in _schedule if e["id"] != entry_id]
+        removed = before != len(_schedule)
+    if removed:
+        _save_schedule()
+        _publish_schedule_state()
+    else:
+        print(f"[schedule] cancel: id {entry_id!r} not found")
+
+def fire_schedule_entry(entry):
+    start_ringing(entry["id"], entry["player_id"], entry["kind"])
+
+# --- Ringing (repeat-until-stopped) ---
+# Separate from the persisted _schedule -- once an alarm/timer is due and
+# starts ringing, it's live/in-memory state, not a future scheduled item.
+# A backend restart mid-ring will simply stop the repetition (acceptable --
+# the underlying announce already returned playback to normal after its
+# last cycle).
+_ringing_lock = threading.Lock()
+_ringing = {}  # entry_id -> {"stop_event": threading.Event, "kind": str, "player_id": str}
+
+def _publish_ringing_state():
+    with _ringing_lock:
+        items = [{"id": eid, "kind": v["kind"], "player_id": v["player_id"]} for eid, v in _ringing.items()]
+    publish_state("ringing", items)
+
+def _ring_loop(entry_id):
+    with _ringing_lock:
+        info = _ringing.get(entry_id)
+    if not info:
+        return
+    stop_event = info["stop_event"]
+    player_id = info["player_id"]
+    kind = info["kind"]
+
+    entity_id = ha_entity_id_for_player(player_id)
+    if not entity_id:
+        print(f"[ring] no HA entity found for player {player_id!r}, aborting {entry_id}")
+        with _ringing_lock:
+            _ringing.pop(entry_id, None)
+        _publish_ringing_state()
+        return
+
+    sound_uri = ALARM_SOUND_URI if kind == "alarm" else TIMER_SOUND_URI
+    while not stop_event.is_set():
+        try:
+            # Generous timeout: HA appears to hold this request open until
+            # the Cast device finishes the announcement and resumes playback
+            # (confirmed via manual testing -- even a 4s beep took several
+            # seconds to return), so the timeout must exceed the sound's
+            # own duration, not just be a generic "fast API call" bound.
+            announce_timeout = max(10.0, _sound_repeat_interval.get(kind, ALARM_REPEAT_INTERVAL_SECONDS) + 10.0)
+            ha_request("POST", "/api/services/media_player/play_media", {
+                "entity_id": entity_id,
+                "media_content_id": sound_uri,
+                "media_content_type": "music",
+                "announce": True,
+            }, timeout=announce_timeout)
+            print(f"[ring] fired {kind} {entry_id} on {entity_id}")
+        except Exception as e:
+            print(f"[ring] fire failed for {entry_id}: {e}")
+        # The announce call above already blocked for ~the real playback
+        # duration -- this is just a short gap before the next cycle, not
+        # another duration-length wait (see ALARM_REPEAT_GAP_SECONDS comment).
+        stop_event.wait(ALARM_REPEAT_GAP_SECONDS)
+
+    with _ringing_lock:
+        _ringing.pop(entry_id, None)
+    _publish_ringing_state()
+    print(f"[ring] stopped {entry_id}")
+
+def start_ringing(entry_id, player_id, kind):
+    stop_event = threading.Event()
+    with _ringing_lock:
+        _ringing[entry_id] = {"stop_event": stop_event, "kind": kind, "player_id": player_id}
+    _publish_ringing_state()
+    threading.Thread(target=_ring_loop, args=(entry_id,), daemon=True).start()
+
+def stop_ringing(entry_id):
+    with _ringing_lock:
+        info = _ringing.get(entry_id)
+    if info:
+        info["stop_event"].set()
+    else:
+        print(f"[ring] stop: {entry_id!r} not currently ringing")
+
+def stop_all_ringing(kind=None):
+    with _ringing_lock:
+        ids = [eid for eid, v in _ringing.items() if kind is None or v["kind"] == kind]
+    for eid in ids:
+        stop_ringing(eid)
+    return ids
+
+def _detect_sound_durations():
+    # Best-effort: on any failure (mutagen not installed, file missing,
+    # unrecognized/corrupt format) this kind just keeps its env-configured
+    # fallback interval instead of crashing startup.
+    try:
+        from mutagen import File as MutagenFile
+    except ImportError:
+        print("[startup] mutagen not installed -- using fixed repeat intervals "
+              "(pip install mutagen --break-system-packages to enable auto-detection)")
+        return
+    for kind, filename, fallback in (
+        ("alarm", ALARM_SOUND_FILE, ALARM_REPEAT_INTERVAL_SECONDS),
+        ("timer", TIMER_SOUND_FILE, TIMER_REPEAT_INTERVAL_SECONDS),
+    ):
+        path = os.path.join(SOUNDS_DIR, filename)
+        try:
+            audio = MutagenFile(path)
+            length = getattr(getattr(audio, "info", None), "length", None)
+            if length:
+                _sound_repeat_interval[kind] = float(length) + REPEAT_INTERVAL_BUFFER_SECONDS
+                print(f"[startup] detected {kind} sound duration {length:.1f}s "
+                      f"-> repeat interval {_sound_repeat_interval[kind]:.1f}s")
+            else:
+                print(f"[startup] couldn't read duration for {kind} sound ({path}), "
+                      f"using fallback {fallback}s")
+        except Exception as e:
+            print(f"[startup] duration detection failed for {kind} sound ({path}): {e}, "
+                  f"using fallback {fallback}s")
+
+def run_schedule_loop():
+    while True:
+        now = time.time()
+        due = []
+        with _schedule_lock:
+            still_pending = []
+            for e in _schedule:
+                (due if e["trigger_at"] <= now else still_pending).append(e)
+            _schedule[:] = still_pending
+        if due:
+            for e in due:
+                fire_schedule_entry(e)
+            _save_schedule()
+            _publish_schedule_state()
+        time.sleep(5)
+
+# --- MQTT client ---
+mqttc = mqtt.Client(client_id="dashboard-backend")
+mqttc.username_pw_set(MQTT_USER, MQTT_PASS)
+
+def publish_state(key, payload):
+    mqttc.publish(f"{STATE_TOPIC}/{key}", json.dumps(payload, ensure_ascii=False), retain=True)
+
+def format_weather_state(state):
+    return {
+        "temp": state["attributes"]["temperature"],
+        "unit": state["attributes"].get("temperature_unit", "°"),
+        "cond": state["state"],
+    }
+
+def handle_ha_state_changed(entity_id, new_state):
+    if entity_id == DUDE_ENTITY:
+        publish_state("dude", {"on": new_state["state"] == "on"})
+    elif entity_id == WEATHER_ENTITY:
+        publish_state("weather", format_weather_state(new_state))
+    elif entity_id == VACUUM_ENTITY:
+        publish_state("vacuum", {"state": new_state["state"]})
+
+def on_mqtt_connect(client, userdata, flags, rc, properties=None):
+    print(f"[MQTT] connected rc={rc}")
+    client.subscribe(f"{CMD_TOPIC}/#")
+
+def _resolve_target_player_id(payload):
+    player_id = payload.get("player_id")
+    if player_id:
+        return player_id
+    player = find_active_player()
+    return player["player_id"] if player else None
+
+def on_mqtt_message(client, userdata, msg):
+    global _active_player_id, _queue_id
+    name = msg.topic.split("/")[-1]
+    print(f"[MQTT] cmd: {name}")
+    try:
+        if name == "shuffle":
+            toggle_shuffle()
+        elif name == "start_radio":
+            start_radio()
+        elif name == "select_player":
+            player_id = (msg.payload or b"").decode("utf-8", "replace").strip()
+            _active_player_id = player_id or None
+            _queue_id = player_id or None
+            print(f"[player] selected {_active_player_id!r}")
+        elif name == "play_playlist":
+            uri = (msg.payload or b"").decode("utf-8", "replace").strip()
+            if not uri:
+                print("[play_playlist] empty payload")
+                return
+            player = find_active_player()
+            if player:
+                # Shuffle must be enabled BEFORE play_media -- the queue
+                # loads with whatever shuffle state is already set on it,
+                # so enabling it after would leave this playback unshuffled.
+                ma_request("player_queues/shuffle", {
+                    "queue_id": player["player_id"],
+                    "shuffle_enabled": True,
+                })
+                ma_request("player_queues/play_media", {
+                    "queue_id": player["player_id"],
+                    "media": uri,
+                    "enqueue": "replace",
+                })
+        elif name == "favorite_add":
+            uri = (msg.payload or b"").decode("utf-8", "replace").strip()
+            if uri:
+                add_favorite(uri)
+        elif name == "favorite_remove":
+            uri = (msg.payload or b"").decode("utf-8", "replace").strip()
+            if uri:
+                remove_favorite(uri)
+        elif name == "set_alarm":
+            payload = json.loads(msg.payload.decode("utf-8"))
+            hh, mm = (int(x) for x in payload["time"].split(":", 1))
+            now_local = datetime.datetime.now().astimezone()
+            trigger_dt = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
+            if trigger_dt <= now_local:
+                trigger_dt += datetime.timedelta(days=1)  # already passed today -> tomorrow
+            player_id = _resolve_target_player_id(payload)
+            if not player_id:
+                print("[set_alarm] no player resolved, aborting")
+                return
+            add_schedule_entry("alarm", trigger_dt.timestamp(), player_id)
+        elif name == "cancel_alarm":
+            cancel_schedule_entry((msg.payload or b"").decode("utf-8", "replace").strip())
+        elif name == "set_timer":
+            payload = json.loads(msg.payload.decode("utf-8"))
+            player_id = _resolve_target_player_id(payload)
+            if not player_id:
+                print("[set_timer] no player resolved, aborting")
+                return
+            add_schedule_entry("timer", time.time() + float(payload["duration_seconds"]), player_id)
+        elif name == "cancel_timer":
+            cancel_schedule_entry((msg.payload or b"").decode("utf-8", "replace").strip())
+        elif name == "stop_alarm":
+            payload_str = (msg.payload or b"").decode("utf-8", "replace").strip()
+            stop_ringing(payload_str) if payload_str else stop_all_ringing(kind="alarm")
+        elif name == "stop_timer":
+            payload_str = (msg.payload or b"").decode("utf-8", "replace").strip()
+            stop_ringing(payload_str) if payload_str else stop_all_ringing(kind="timer")
+        elif name in MEDIA_ACTIONS:
+            player = find_active_player()
+            if player:
+                ma_request(MEDIA_ACTIONS[name], {"player_id": player["player_id"]})
+        elif name in ACTIONS:
+            method, path, body = ACTIONS[name]
+            ha_request(method, path, body)
+        else:
+            print(f"[MQTT] unknown command: {name}")
+    except Exception as e:
+        print(f"[MQTT] error handling '{name}': {e}")
+
+mqttc.on_connect = on_mqtt_connect
+mqttc.on_message = on_mqtt_message
+
+# --- HA WebSocket listener ---
+async def ha_ws_loop():
+    while True:
+        try:
+            async with websockets.connect(HA_WS_URL) as ws:
+                await ws.recv()  # auth_required
+                await ws.send(json.dumps({"type": "auth", "access_token": HA_TOKEN}))
+                auth_result = json.loads(await ws.recv())
+                if auth_result.get("type") != "auth_ok":
+                    print(f"[HA WS] auth failed: {auth_result}")
+                    await asyncio.sleep(5)
+                    continue
+                print("[HA WS] authenticated")
+
+                await ws.send(json.dumps({"id": 1, "type": "subscribe_events", "event_type": "state_changed"}))
+                await ws.recv()  # subscribe ack
+
+                for entity_id in WATCHED_ENTITIES:
+                    try:
+                        state = ha_request("GET", f"/api/states/{entity_id}")
+                        handle_ha_state_changed(entity_id, state)
+                    except Exception as e:
+                        print(f"[HA WS] initial fetch failed for {entity_id}: {e}")
+
+                async for raw in ws:
+                    msg = json.loads(raw)
+                    if msg.get("type") != "event":
+                        continue
+                    data = msg["event"]["data"]
+                    entity_id = data.get("entity_id")
+                    if entity_id in WATCHED_ENTITIES and data.get("new_state"):
+                        handle_ha_state_changed(entity_id, data["new_state"])
+
+        except Exception as e:
+            print(f"[HA WS] connection error: {e}, retrying in 5s")
+            await asyncio.sleep(5)
+
+# --- Playlists cache, served over HTTP ---
+_playlists_lock = threading.Lock()
+_playlists_cache = []
+
+def fetch_and_cache_playlists():
+    # Verified against a real curl call to this exact service+payload --
+    # response shape is {"service_response": {"items": [{"name", "uri", ...}]}},
+    # confirmed 2026-09-10. Deliberately NOT using the MusicAssistantClient
+    # library here (unlike ma_ws_loop) since this HA-service-call path is
+    # the one we've actually confirmed works.
+    try:
+        data = ha_request("POST", "/api/services/music_assistant/get_library?return_response", {
+            "favorite": False,
+            "limit": 30,
+            "offset": 0,
+            "album_artists_only": False,
+            "media_type": "playlist",
+            "config_entry_id": MA_CONFIG_ENTRY_ID,
+            "order_by": "name_desc",
+        })
+        items_raw = data.get("service_response", {}).get("items", [])
+        items = [
+            {"name": sanitize_text(p.get("name")), "uri": p.get("uri")}
+            for p in items_raw if p.get("name") and p.get("uri")
+        ]
+        global _playlists_cache
+        with _playlists_lock:
+            _playlists_cache = items
+        print(f"[playlists] cached {len(items)} playlists")
+    except Exception as e:
+        print(f"[playlists] fetch failed: {e}")
+
+def run_playlists_loop():
+    while True:
+        fetch_and_cache_playlists()
+        time.sleep(3600)
+
+class DashboardHTTPHandler(BaseHTTPRequestHandler):
+    def _send_json(self, obj, status=200):
+        body = json.dumps(obj).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_sound_file(self, filename):
+        # Basic path-traversal guard -- reject anything with a separator
+        # or a leading dot once decoded, and resolve+confirm the final
+        # path is still inside SOUNDS_DIR before opening it.
+        if not filename or "/" in filename or "\\" in filename or filename.startswith("."):
+            self.send_response(400)
+            self.end_headers()
+            return
+        full_path = os.path.realpath(os.path.join(SOUNDS_DIR, filename))
+        if not full_path.startswith(os.path.realpath(SOUNDS_DIR) + os.sep):
+            self.send_response(400)
+            self.end_headers()
+            return
+        if not os.path.isfile(full_path):
+            self.send_response(404)
+            self.end_headers()
+            return
+        content_type = mimetypes.guess_type(full_path)[0] or "application/octet-stream"
+        with open(full_path, "rb") as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):
+        if self.path == "/playlists":
+            with _playlists_lock:
+                self._send_json(_playlists_cache)
+        elif self.path == "/players":
+            # Live-fetched on every request, not cached -- players change
+            # far less often than playback state, and always reading MA's
+            # current list (rather than anything persisted/hardcoded) is
+            # the deliberate design here, same reasoning as never trusting
+            # a stored player UUID.
+            try:
+                players = ma_request("players/all") or []
+                self._send_json([
+                    {
+                        "player_id": p.get("player_id"),
+                        "name": p.get("name"),
+                        "available": p.get("available"),
+                    }
+                    for p in players
+                ])
+            except Exception as e:
+                print(f"[players] fetch failed: {e}")
+                self.send_response(502)
+                self.end_headers()
+        elif self.path.startswith("/sounds/"):
+            filename = unquote(self.path[len("/sounds/"):])
+            self._send_sound_file(filename)
+        elif self.path == "/ringing":
+            with _ringing_lock:
+                items = [{"id": eid, "kind": v["kind"], "player_id": v["player_id"]}
+                         for eid, v in _ringing.items()]
+            self._send_json(items)
+        elif self.path.startswith("/stop_ringing"):
+            # Plain HTTP GET so this is reachable from any phone/laptop
+            # browser on the LAN with zero setup -- no MQTT client needed.
+            # ?id=<entry_id> stops just that one; no query string stops
+            # everything currently ringing (the common "make it stop" case).
+            qs = parse_qs(urlsplit(self.path).query)
+            ids = qs.get("id")
+            if ids:
+                for i in ids:
+                    stop_ringing(i)
+                stopped = ids
+            else:
+                stopped = stop_all_ringing()
+            self._send_json({"stopped": stopped})
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass  # quiet by default; drop this override if you want request logging
+
+# --- MA WebSocket listener: push now-playing + queue-next + periodic playlist catalog ---
+_queue_id = None  # module-level so on_mqtt_message's select_player can redirect it live
+
+async def ma_ws_loop():
+    global _queue_id
+    while True:
+        try:
+            async with MusicAssistantClient(MA_URL, None, token=MA_TOKEN) as client:
+
+                def on_event(event):
+                    if _queue_id is None or getattr(event, "object_id", None) != _queue_id:
+                        return
+                    data = getattr(event, "data", None)
+                    if not isinstance(data, dict):
+                        return
+                    publish_state("shuffle", {"on": bool(data.get("shuffle_enabled"))})
+                    current_item = data.get("current_item") or {}
+                    media_item = current_item.get("media_item") or {}
+                    state = data.get("state")
+                    if state in ("playing", "paused") and not media_item:
+                        return  # transient mid-transition event
+
+                    artists = media_item.get("artists") or []
+                    album = media_item.get("album") or {}
+                    image = current_item.get("image") or {}
+                    art_url = None
+                    if image.get("proxy_id"):
+                        art_url = f"{MA_URL}/imageproxy/{image['proxy_id']}?size=256&fmt=jpeg"
+
+                    publish_state("now-playing", {
+                        "playing": state == "playing",
+                        "title": sanitize_text(media_item.get("name")),
+                        "artist": sanitize_text(artists[0]["name"]) if artists else None,
+                        "album": sanitize_text(album.get("name")),
+                        "art": art_url,
+                    })
+
+                    # Next-4 queue items. Confirmed working 2026-09-16 --
+                    # queue_item_id matches between current_item and
+                    # player_queues/items results. Makes a blocking HTTP
+                    # call from this (synchronous) event callback, which
+                    # briefly stalls the MA event loop -- fine at normal
+                    # track-change frequency.
+                    queue_item_id = current_item.get("queue_item_id")
+                    upcoming = []
+                    if queue_item_id:
+                        try:
+                            items = ma_request("player_queues/items", {
+                                "queue_id": _queue_id, "limit": 20, "offset": 0,
+                            }) or []
+                            pos = next((i for i, it in enumerate(items)
+                                        if it.get("queue_item_id") == queue_item_id), None)
+                            if pos is not None:
+                                for it in items[pos + 1: pos + 5]:
+                                    mi = it.get("media_item") or {}
+                                    a = mi.get("artists") or []
+                                    upcoming.append({
+                                        "title": sanitize_text(mi.get("name")),
+                                        "artist": sanitize_text(a[0]["name"]) if a else None,
+                                    })
+                        except Exception as e:
+                            print(f"[queue] items fetch failed: {e}")
+                    publish_state("queue_next", upcoming)
+
+                print("[MA WS] connected to MA, subscribing...")
+                client.subscribe(on_event)
+
+                player = find_active_player()
+                if player:
+                    _queue_id = player["player_id"]
+                    print(f"[MA WS] resolved queue_id={_queue_id!r}")
+                else:
+                    print(f"[MA WS] no active player resolved at connect time")
+
+                print("[MA WS] listening for events...")
+                await client.start_listening()
+
+        except Exception as e:
+            print(f"[MA WS] connection error: {e}, retrying in 5s")
+            await asyncio.sleep(5)
+
+# --- Forecast (daily) ---
+def fetch_and_publish_forecast():
+    try:
+        data = ha_request("POST", "/api/services/weather/get_forecasts?return_response", {
+            "entity_id": WEATHER_ENTITY, "type": "daily",
+        })
+        forecasts = data.get("service_response", {}).get(WEATHER_ENTITY, {}).get("forecast", [])
+        days = []
+        for entry in forecasts[1:1 + 4]:
+            day_name = "?"
+            dt = entry.get("datetime")
+            if dt:
+                try:
+                    day_name = datetime.datetime.fromisoformat(dt).strftime("%a")
+                except ValueError:
+                    pass
+            days.append({"day": day_name, "temp": entry.get("temperature"), "cond": entry.get("condition")})
+        publish_state("forecast", days)
+    except Exception as e:
+        print(f"[forecast] fetch failed: {e}")
+
+def run_forecast_loop():
+    while True:
+        fetch_and_publish_forecast()
+        time.sleep(3600)
+
+# --- Forecast (hourly) ---
+def fetch_and_publish_forecast_hourly():
+    # Filters by actual timestamp rather than slicing by index -- HA's
+    # hourly forecast list can include already-elapsed entries (confirmed
+    # 2026-09-15: index 0 was 2 hours in the past), unlike daily's list
+    # where skipping index 0 is correct. Takes the first 4 entries whose
+    # datetime is still in the future.
+    try:
+        data = ha_request("POST", "/api/services/weather/get_forecasts?return_response", {
+            "entity_id": WEATHER_ENTITY, "type": "hourly",
+        })
+        forecasts = data.get("service_response", {}).get(WEATHER_ENTITY, {}).get("forecast", [])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        hours = []
+        for entry in forecasts:
+            dt_raw = entry.get("datetime")
+            if not dt_raw:
+                continue
+            try:
+                dt = datetime.datetime.fromisoformat(dt_raw)
+            except ValueError:
+                continue
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=datetime.timezone.utc)
+            if dt < now:
+                continue
+            hours.append({
+                "hour": dt.astimezone().strftime("%H:%M"),
+                "temp": entry.get("temperature"),
+                "cond": entry.get("condition"),
+            })
+            if len(hours) == 4:
+                break
+        publish_state("forecast_hourly", hours)
+    except Exception as e:
+        print(f"[forecast_hourly] fetch failed: {e}")
+
+def run_forecast_hourly_loop():
+    while True:
+        fetch_and_publish_forecast_hourly()
+        time.sleep(3600)
+
+if __name__ == "__main__":
+    for _label, _fname in (("alarm", ALARM_SOUND_FILE), ("timer", TIMER_SOUND_FILE)):
+        _path = os.path.join(SOUNDS_DIR, _fname)
+        if not os.path.isfile(_path):
+            print(f"[startup] WARNING: {_label} sound file not found at {_path} -- "
+                  f"{_label}s will fail to fire until this exists")
+
+    _detect_sound_durations()
+
+    mqttc.connect(MQTT_HOST, MQTT_PORT, keepalive=60)
+    mqttc.loop_start()
+
+    _load_schedule()
+
+    threading.Thread(target=lambda: asyncio.run(ha_ws_loop()), daemon=True).start()
+    threading.Thread(target=lambda: asyncio.run(ma_ws_loop()), daemon=True).start()
+    threading.Thread(target=run_forecast_loop, daemon=True).start()
+    threading.Thread(target=run_forecast_hourly_loop, daemon=True).start()
+    threading.Thread(target=run_playlists_loop, daemon=True).start()
+    threading.Thread(target=run_schedule_loop, daemon=True).start()
+    threading.Thread(
+        target=lambda: ThreadingHTTPServer(("0.0.0.0", PLAYLISTS_HTTP_PORT), DashboardHTTPHandler).serve_forever(),
+        daemon=True,
+    ).start()
+
+    print("[backend] running (Ctrl+C to stop)")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\n[backend] shutting down")
+        mqttc.loop_stop()
+        mqttc.disconnect()
+((venv) ) orangepi@brain:~/dashboard$ 
